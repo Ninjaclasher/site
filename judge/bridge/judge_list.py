@@ -100,34 +100,74 @@ class JudgeList(object):
     def check_priority(self, priority):
         return 0 <= priority < self.priorities
 
-    def judge(self, id, problem, language, source, judge_id, priority):
-        with self.lock:
-            if id in self.submission_map or id in self.node_map:
-                # Already judging, don't queue again. This can happen during batch rejudges, rejudges should be
-                # idempotent.
-                return
+    def judge(self, submissions):
+        # Standard case
+        if len(submissions) == 1:
+            with self.lock:
+                submission = submissions[0]
+                id = submission.id
+                problem = submission.problem
+                language = submission.language
+                source = submission.source
+                judge_id = submission.judge_id
+                priority = submission.priority
 
-            candidates = [
-                judge for judge in self.judges if not judge.working and judge.can_judge(problem, language, judge_id)
-            ]
-            if judge_id:
-                logger.info('Specified judge %s is%savailable', judge_id, ' ' if candidates else ' not ')
-            else:
+                if id in self.submission_map or id in self.node_map:
+                    # Already judging, don't queue again. This can happen during batch rejudges, rejudges should be
+                    # idempotent.
+                    return
+
+                candidates = [
+                    judge for judge in self.judges if not judge.working and judge.can_judge(problem, language, judge_id)
+                ]
+                if judge_id:
+                    logger.info('Specified judge %s is%savailable', judge_id, ' ' if candidates else ' not ')
+                else:
+                    logger.info('Free judges: %d', len(candidates))
+                if candidates:
+                    # Schedule the submission on the judge reporting least load.
+                    judge = min(candidates, key=attrgetter('load'))
+                    logger.info('Dispatched submission %d to: %s', id, judge.name)
+                    self.submission_map[id] = judge
+                    try:
+                        judge.submit(id, problem, language, source)
+                    except Exception:
+                        logger.exception('Failed to dispatch %d (%s, %s) to %s', id, problem, language, judge.name)
+                        self.judges.discard(judge)
+                        return self.judge([submissions])
+                else:
+                    self.node_map[id] = self.queue.insert(
+                        (id, problem, language, source, judge_id),
+                        self.priority[priority],
+                    )
+                    logger.info('Queued submission: %d', id)
+        # Batch case
+        else:
+            # TODO: on a large batch rejudge, this might take a long time, maybe there should be a batch size?
+            # TODO: do we need this case, or should we just use the standard case for large batches?
+            with self.lock:
+                for submission in submissions:
+                    id = submission.id
+                    problem = submission.problem
+                    language = submission.language
+                    source = submission.source
+                    judge_id = submission.judge_id
+                    priority = submission.priority
+
+                    if id in self.submission_map or id in self.node_map:
+                        # Already judging, don't queue again. This can happen during batch rejudges, rejudges should be
+                        # idempotent.
+                        return
+
+                    self.node_map[id] = self.queue.insert(
+                        (id, problem, language, source, judge_id),
+                        self.priority[priority],
+                    )
+                    logger.info('Queued submission: %d', id)
+
+                # Prioritize the judge reporting least load.
+                candidates = sorted((judge for judge in self.judges if not judge.working), key=attrgetter('load'))
                 logger.info('Free judges: %d', len(candidates))
-            if candidates:
-                # Schedule the submission on the judge reporting least load.
-                judge = min(candidates, key=attrgetter('load'))
-                logger.info('Dispatched submission %d to: %s', id, judge.name)
-                self.submission_map[id] = judge
-                try:
-                    judge.submit(id, problem, language, source)
-                except Exception:
-                    logger.exception('Failed to dispatch %d (%s, %s) to %s', id, problem, language, judge.name)
-                    self.judges.discard(judge)
-                    return self.judge(id, problem, language, source, judge_id, priority)
-            else:
-                self.node_map[id] = self.queue.insert(
-                    (id, problem, language, source, judge_id),
-                    self.priority[priority],
-                )
-                logger.info('Queued submission: %d', id)
+
+                for judge in candidates:
+                    self._handle_free_judge(judge)

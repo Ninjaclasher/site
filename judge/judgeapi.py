@@ -5,6 +5,7 @@ import struct
 import zlib
 
 from django.conf import settings
+from django.db.models.query import QuerySet
 
 from judge import event_poster as event
 
@@ -48,25 +49,16 @@ def judge_request(packet, reply=True):
         return result
 
 
-def judge_submission(submission, rejudge=False, batch_rejudge=False, judge_id=None):
-    from .models import ContestSubmission, Submission, SubmissionTestCase
+def judge_submission(submissions, rejudge=False, judge_id=None):
+    from .models import Submission, SubmissionTestCase
 
     CONTEST_SUBMISSION_PRIORITY = 0
     DEFAULT_PRIORITY = 1
     REJUDGE_PRIORITY = 2
     BATCH_REJUDGE_PRIORITY = 3
 
-    updates = {'time': None, 'memory': None, 'points': None, 'result': None, 'case_points': 0,
-               'case_total': 0, 'error': None, 'was_rejudged': rejudge or batch_rejudge, 'status': 'QU'}
-    try:
-        # This is set proactively; it might get unset in judgecallback's on_grading_begin if the problem doesn't
-        # actually have pretests stored on the judge.
-        updates['is_pretested'] = all(ContestSubmission.objects.filter(submission=submission)
-                                      .values_list('problem__contest__run_pretests_only', 'problem__is_pretested')[0])
-    except IndexError:
-        priority = DEFAULT_PRIORITY
-    else:
-        priority = CONTEST_SUBMISSION_PRIORITY
+    if not isinstance(submissions, QuerySet):
+        submissions = Submission.objects.filter(id__in=submissions)
 
     # This should prevent double rejudge issues by permitting only the judging of
     # QU (which is the initial state) and D (which is the final state).
@@ -76,30 +68,67 @@ def judge_submission(submission, rejudge=False, batch_rejudge=False, judge_id=No
     # as that would prevent people from knowing a submission is being scheduled for rejudging.
     # It is worth noting that this mechanism does not prevent a new rejudge from being scheduled
     # while already queued, but that does not lead to data corruption.
-    if not Submission.objects.filter(id=submission.id).exclude(status__in=('P', 'G')).update(**updates):
+    submissions.exclude(status__in=('P', 'G'))
+    submission_count = submissions.count()
+
+    if not submission_count:
         return False
 
-    SubmissionTestCase.objects.filter(submission_id=submission.id).delete()
+    batch_rejudge = submission_count > 1
+
+    updates = {'time': None, 'memory': None, 'points': None, 'result': None, 'case_points': 0,
+               'case_total': 0, 'error': None, 'was_rejudged': rejudge or batch_rejudge, 'status': 'QU'}
+
+    submissions.update(**updates)
+    # This is set proactively; it might get unset in judge_handler's on_grading_begin if the problem doesn't
+    # actually have pretests stored on the judge.
+    submissions.filter(
+        contest_object__run_pretests_only=True,
+        contest__problem__is_pretested=True,
+    ).update(is_pretested=True)
+
+    # TODO: perhaps we should employ join_sql_subquery if this is too slow
+    SubmissionTestCase.objects.filter(submission__in=submissions).delete()
+
+    if batch_rejudge:
+        priority = BATCH_REJUDGE_PRIORITY
+    elif rejudge:
+        priority = REJUDGE_PRIORITY
+    # This branch should never be reached when there is more than one submission, so we can
+    # simply grab the first submission and check if it is a contest submission to determine the
+    # priority.
+    elif submissions[0].contest_object_id is not None:
+        priority = CONTEST_SUBMISSION_PRIORITY
+    else:
+        priority = DEFAULT_PRIORITY
 
     try:
         response = judge_request({
             'name': 'submission-request',
-            'submission-id': submission.id,
-            'problem-id': submission.problem.code,
-            'language': submission.language.key,
-            'source': submission.source.source,
+            'submissions': [
+                {
+                    'submission-id': submission['id'],
+                    'problem-id': submission['problem__code'],
+                    'language': submission['language__key'],
+                    'source': submission['source__source'],
+                }
+                for submission in submissions.values_list('id', 'problem__code', 'language__key', 'source__source')
+            ],
             'judge-id': judge_id,
-            'priority': BATCH_REJUDGE_PRIORITY if batch_rejudge else (REJUDGE_PRIORITY if rejudge else priority),
+            'priority': priority,
         })
     except BaseException:
         logger.exception('Failed to send request to judge')
-        Submission.objects.filter(id=submission.id).update(status='IE', result='IE')
+        submissions.update(status='IE', result='IE')
         success = False
     else:
-        if response['name'] != 'submission-received' or response['submission-id'] != submission.id:
-            Submission.objects.filter(id=submission.id).update(status='IE', result='IE')
-        _post_update_submission(submission)
-        success = True
+        if response['name'] != 'submission-received' or response['submission-count'] != submission_count:
+            submissions.update(status='IE', result='IE')
+            success = False
+        else:
+            success = True
+        for submission in submissions.select_related('contest_object', 'language').iterator():
+            _post_update_submission(submission)
     return success
 
 

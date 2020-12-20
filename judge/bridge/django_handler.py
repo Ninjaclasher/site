@@ -1,11 +1,15 @@
 import json
 import logging
 import struct
+from collections import namedtuple
 
 from judge.bridge.base_handler import Disconnect, ZlibPacketHandler
 
 logger = logging.getLogger('judge.bridge')
 size_pack = struct.Struct('!I')
+
+
+SubmissionJudgeRequest = namedtuple('SubmissionJudgeRequest', 'id problem language source judge_id priority')
 
 
 class DjangoHandler(ZlibPacketHandler):
@@ -33,16 +37,23 @@ class DjangoHandler(ZlibPacketHandler):
         raise Disconnect()
 
     def on_submission(self, data):
-        id = data['submission-id']
-        problem = data['problem-id']
-        language = data['language']
-        source = data['source']
         judge_id = data['judge-id']
         priority = data['priority']
         if not self.judges.check_priority(priority):
             return {'name': 'bad-request'}
-        self.judges.judge(id, problem, language, source, judge_id, priority)
-        return {'name': 'submission-received', 'submission-id': id}
+
+        submissions = [
+            SubmissionJudgeRequest(
+                id=sub['submission-id'],
+                problem=sub['problem-id'],
+                language=sub['language'],
+                source=sub['source'],
+                judge_id=judge_id,
+                priority=priority,
+            ) for sub in data['submissions']
+        ]
+        self.judges.judge(submissions)
+        return {'name': 'submission-received', 'submission-count': len(submissions)}
 
     def on_termination(self, data):
         return {'name': 'submission-received', 'judge-aborted': self.judges.abort(data['submission-id'])}
